@@ -1,7 +1,7 @@
 /**
- * This script file generates API Tokens.
+ * This script file generates/revokes API Tokens.
  * 
- * Owned by 'Shore-Interactive'
+ * Owned by Shore-Interactive
  * Version 0.0.1
  * 
  */
@@ -46,13 +46,13 @@ function revokeToken(name) {
     console.log(`Token for ${name} has been revoked.`)
 }
 
-const [, , command, name] = process.argv;
+const [, , STR_COMMAND, STR_NAME] = process.argv;
 
 // Depending on the command received, execute the respective function
-if(command === 'generate' && name) {
-    generateToken(name);
-} else if (command === 'revoke' && name) {
-    revokeToken(name);  
+if(STR_COMMAND === 'generate' && STR_NAME) {
+    generateToken(STR_NAME);
+} else if (STR_COMMAND === 'revoke' && STR_NAME) {
+    revokeToken(STR_NAME);
 } else {
     console.log('Usage:')
     console.log('   node token-manager.js generate "Customer Name"');

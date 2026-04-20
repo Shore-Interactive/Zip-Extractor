@@ -13,8 +13,13 @@ const path = require('path');
 const crypto = require('crypto');
 const db = require('./db');
 const rateLimit = require('express-rate-limit');
+const cors = require('cors')
 
 const OBJ_APP = express();
+// Because we are routing the traffic through NGINX, a header is added with the origin IP
+// We need to trust it, otherwise Express will return errors
+OBJ_APP.set('trust proxy', 1)
+OBJ_APP.use(cors());
 // Important - Limit the File Size to 100MB for now, as it is the largest example we have seen
 const OBJ_UPLOAD = multer({
     dest: 'uploads/',
@@ -30,7 +35,7 @@ const OBJ_UPLOAD_LIMITER = rateLimit({
 // Limit the amount of fetches PER 15 MINUTES
 const OBJ_FETCH_LIMITER = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 200,
+    max: 2000,
     message: {error: 'Too many requests, please try again later'}
 });
 
@@ -55,7 +60,11 @@ function getTokenName(token) {
 
 const OBJ_CLEANUP_TIMERS = {};
 
-// Clean up and left behind uploads from a previous server run (after shutdown, reboot, etc.)
+function logRequest(STR_ENDPOINT, STR_JOB_ID, STR_TOKEN_NAME) {
+    console.log(`[${new Date().toISOString()}] ${STR_ENDPOINT} | job: ${STR_JOB_ID} | client: ${STR_TOKEN_NAME}`);
+}
+
+// Clean up any left behind uploads from a previous server run (after shutdown, reboot, etc.)
 if(fs.existsSync('uploads')) {
     fs.rmSync('uploads', {recursive: true, force: true});
     fs.mkdirSync('uploads');
@@ -73,7 +82,7 @@ function scheduleCleanup(STR_JOB_ID, STR_FOLDER, STR_UPLOADED_FILE) {
         fs.rmSync(STR_UPLOADED_FILE, {force: true});
         delete OBJ_CLEANUP_TIMERS[STR_JOB_ID];
         console.log('Cleaned up job:', STR_FOLDER);
-    }, 5 * 60 * 1000);
+    }, 30 * 60 * 1000);
 }
 
 OBJ_APP.get('/', (_, response) => {
@@ -93,9 +102,13 @@ OBJ_APP.post('/extract', OBJ_UPLOAD_LIMITER, OBJ_UPLOAD.single('zipfile'), (requ
         return response.status(400).json({error: 'No file uploaded'});
     }
 
+
     // If code reaches this stage, all is well, so start extraction
     const STR_JOB_ID = crypto.randomUUID();
     const STR_EXTRACT_FOLDER = path.join('uploads', STR_JOB_ID);
+
+    logRequest('POST /extract', STR_JOB_ID, getTokenName(STR_API_KEY));
+
     // Create a temporary folder to save the extracted files
     fs.mkdirSync(STR_EXTRACT_FOLDER, {recursive: true});
     // Log the time before extraction start
@@ -104,10 +117,27 @@ OBJ_APP.post('/extract', OBJ_UPLOAD_LIMITER, OBJ_UPLOAD.single('zipfile'), (requ
     fs.createReadStream(request.file.path)
     .pipe(unzipper.Extract({path: STR_EXTRACT_FOLDER}))
     .on('close', () => {
-        const ARR_FILES = fs.readdirSync(STR_EXTRACT_FOLDER);
-        // Collect the file types in an array
-        const ARR_XML_FILES = ARR_FILES.filter(f => f.endsWith('.xml'));
-        const ARR_PDF_FILES = ARR_FILES.filter(f => f.endsWith('.pdf'));
+        // Read all the files in the extracted folder recursively
+        const ARR_FILES = fs.readdirSync(STR_EXTRACT_FOLDER, {recursive: true})
+            .filter(f => !fs.statSync(path.join(STR_EXTRACT_FOLDER, f)).isDirectory());
+        const OBJ_INVOICES = {};
+        // For each file,
+        for (const STR_FILE of ARR_FILES) {
+            const STR_BASENAME = path.basename(STR_FILE);
+            const ARR_PARTS = STR_BASENAME.split('-');
+            const STR_INVOICE_ID = ARR_PARTS[ARR_PARTS.length - 2];
+
+            if(!OBJ_INVOICES[STR_INVOICE_ID]) {
+                OBJ_INVOICES[STR_INVOICE_ID] = {xmlFiles: [], pdfFile: null}
+            }
+
+            if(STR_BASENAME.endsWith('.xml')) {
+                OBJ_INVOICES[STR_INVOICE_ID].xmlFiles.push(STR_FILE);
+            } else if(STR_BASENAME.endsWith('.pdf') && !OBJ_INVOICES[STR_INVOICE_ID].pdfFile) {
+                OBJ_INVOICES[STR_INVOICE_ID].pdfFile = STR_FILE;
+            }
+        }
+
         // Insert a log into the database for the successful extraction
         db.prepare(`
             INSERT INTO requests (timestamp, token_name, filename, file_size_bytes, job_id, processing_time_ms, status)
@@ -128,10 +158,8 @@ OBJ_APP.post('/extract', OBJ_UPLOAD_LIMITER, OBJ_UPLOAD.single('zipfile'), (requ
 
         response.json({
             intJobId: STR_JOB_ID,
-            objXMLFiles: ARR_XML_FILES,
-            objPDFFiles: ARR_PDF_FILES,
-            intTotalXML: ARR_XML_FILES.length,
-            intTotalPDF: ARR_PDF_FILES.length
+            objInvoices: OBJ_INVOICES,
+            intTotalInvoices: Object.keys(OBJ_INVOICES).length
         });
     })
     .on('error', (ex) => {
@@ -169,14 +197,18 @@ OBJ_APP.get('/job/:jobId/xml', OBJ_FETCH_LIMITER, (request, response) => {
     if(!fs.existsSync(STR_EXTRACT_FOLDER)) {
         return response.status(404).json({error: 'Job not found'});
     }
-    // Read the directory and obtain all XML files
-    const ARR_ALL_XML = fs.readdirSync(STR_EXTRACT_FOLDER).filter(f => f.endsWith('.xml'));
+
+    logRequest('GET /xml', request.params.jobId, getTokenName(STR_API_KEY));
+
+    // Read the directory and obtain all XML files recursively
+    const ARR_ALL_XML = fs.readdirSync(STR_EXTRACT_FOLDER, {recursive: true})
+        .filter(f => !fs.statSync(path.join(STR_EXTRACT_FOLDER, f)).isDirectory() && f.endsWith('.xml'));
     const ARR_PAGE = ARR_ALL_XML.slice((INT_PAGE - 1) * INT_PAGE_SIZE, INT_PAGE * INT_PAGE_SIZE);
 
     const OBJ_XML_CONTENTS = {};
     for (const STR_FILE of ARR_PAGE) {
         const STR_FILE_PATH = path.join(STR_EXTRACT_FOLDER, STR_FILE);
-        OBJ_XML_CONTENTS[STR_FILE] = fs.readFileSync(STR_FILE_PATH).toString('base64');
+        OBJ_XML_CONTENTS[path.basename(STR_FILE)] = fs.readFileSync(STR_FILE_PATH).toString('base64');
     }
 
     // Mark for cleanup after inactivity
@@ -194,7 +226,7 @@ OBJ_APP.get('/job/:jobId/xml', OBJ_FETCH_LIMITER, (request, response) => {
 /**
  * Since we only have to obtain 1 PDF file per Invoice, we can retrieve them on a single fetch basis, instead of just pumping all the PDF files back
  */
-OBJ_APP.get('/job/:jobId/pdf/:filename', OBJ_FETCH_LIMITER, (request, response) => {
+OBJ_APP.get('/job/:jobId/pdf', OBJ_FETCH_LIMITER, (request, response) => {
     const STR_API_KEY = request.headers['x-api-key'];
 
     // Validate the API key
@@ -203,7 +235,7 @@ OBJ_APP.get('/job/:jobId/pdf/:filename', OBJ_FETCH_LIMITER, (request, response) 
     }
     // Define the folder/filepath from the parameters
     const STR_EXTRACT_FOLDER = path.join('uploads', request.params.jobId);
-    const STR_FILE_PATH = path.join(STR_EXTRACT_FOLDER, request.params.filename);
+    const STR_FILE_PATH = path.join(STR_EXTRACT_FOLDER, request.query.filename);
 
     const STR_RESOLVED_PATH = path.resolve(STR_FILE_PATH);
     const STR_RESOLVED_FOLDER = path.resolve(STR_EXTRACT_FOLDER);
@@ -218,10 +250,81 @@ OBJ_APP.get('/job/:jobId/pdf/:filename', OBJ_FETCH_LIMITER, (request, response) 
     if(!fs.existsSync(STR_FILE_PATH)) {
         return response.status(404).json({error: 'File not found'});
     }
+    logRequest('GET /pdf/:filename', request.params.jobId, getTokenName(STR_API_KEY));
     // Schedule for cleanup after inactivity
     scheduleCleanup(request.params.jobId, STR_EXTRACT_FOLDER, '');
-    // Return the file
-    response.download(STR_FILE_PATH);
+    // Return as base64 JSON so binary data is not mangled over HTTP
+    const STR_CONTENT = fs.readFileSync(STR_FILE_PATH).toString('base64');
+    response.json({ filename: path.basename(STR_FILE_PATH), content: STR_CONTENT });
+});
+
+OBJ_APP.get('/job/:jobId/invoices', OBJ_FETCH_LIMITER, (request, response) => {
+    const STR_API_KEY = request.headers['x-api-key'];
+
+    if (!STR_API_KEY || !isValidToken(STR_API_KEY)) {
+        return response.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const STR_EXTRACT_FOLDER = path.join('uploads', request.params.jobId);
+
+    if (!fs.existsSync(STR_EXTRACT_FOLDER)) {
+        return response.status(404).json({ error: 'Job not found' });
+    }
+
+    logRequest('GET /invoices', request.params.jobId, getTokenName(STR_API_KEY));
+
+    const ARR_FILES = fs.readdirSync(STR_EXTRACT_FOLDER, { recursive: true })
+        .filter(f => !fs.statSync(path.join(STR_EXTRACT_FOLDER, f)).isDirectory());
+    const OBJ_INVOICES = {};
+
+    for (const STR_FILE of ARR_FILES) {
+        const STR_BASENAME = path.basename(STR_FILE);
+        const ARR_PARTS = STR_BASENAME.split('-');
+        const STR_INVOICE_NUMBER = ARR_PARTS[ARR_PARTS.length - 2];
+
+        if (!OBJ_INVOICES[STR_INVOICE_NUMBER]) {
+            OBJ_INVOICES[STR_INVOICE_NUMBER] = { xmlFiles: [], pdfFile: null };
+        }
+
+        if (STR_BASENAME.endsWith('.xml')) {
+            OBJ_INVOICES[STR_INVOICE_NUMBER].xmlFiles.push(STR_FILE);
+        } else if (STR_BASENAME.endsWith('.pdf') && !OBJ_INVOICES[STR_INVOICE_NUMBER].pdfFile) {
+            OBJ_INVOICES[STR_INVOICE_NUMBER].pdfFile = STR_FILE;
+        }
+    }
+
+    scheduleCleanup(request.params.jobId, STR_EXTRACT_FOLDER, '');
+
+    response.json({ invoices: OBJ_INVOICES });
+});
+
+OBJ_APP.get('/job/:jobId/xml/file', OBJ_FETCH_LIMITER, (request, response) => {
+    const STR_API_KEY = request.headers['x-api-key'];
+
+    if (!STR_API_KEY || !isValidToken(STR_API_KEY)) {
+        return response.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const STR_EXTRACT_FOLDER = path.join('uploads', request.params.jobId);
+    const STR_FILE_PATH = path.join(STR_EXTRACT_FOLDER, request.query.filename);
+
+    const STR_RESOLVED_PATH = path.resolve(STR_FILE_PATH);
+    const STR_RESOLVED_FOLDER = path.resolve(STR_EXTRACT_FOLDER);
+
+    if (!STR_RESOLVED_PATH.startsWith(STR_RESOLVED_FOLDER)) {
+        return response.status(400).json({ error: 'Invalid filename' });
+    }
+
+    if (!fs.existsSync(STR_FILE_PATH)) {
+        return response.status(404).json({ error: 'File not found' });
+    }
+
+    logRequest('GET /xml/:filename', request.params.jobId, getTokenName(STR_API_KEY));
+
+    scheduleCleanup(request.params.jobId, STR_EXTRACT_FOLDER, '');
+
+    const STR_CONTENT = fs.readFileSync(STR_FILE_PATH).toString('base64');
+    response.json({ filename: request.query.filename, content: STR_CONTENT });
 });
 
 OBJ_APP.listen(INT_PORT, () => {

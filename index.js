@@ -12,13 +12,15 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
-const cors = require('cors')
+const cors = require('cors');
+const helmet = require('helmet');
 
 const OBJ_APP = express();
 // Because we are routing the traffic through NGINX, a header is added with the origin IP
 // We need to trust it, otherwise Express will return errors
 OBJ_APP.set('trust proxy', 1)
 OBJ_APP.use(cors());
+OBJ_APP.use(helmet());
 // Important - Limit the File Size to 100MB for now, as it is the largest example we have seen
 const OBJ_UPLOAD = multer({
     dest: 'uploads/',

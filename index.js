@@ -70,7 +70,7 @@ if(fs.existsSync('uploads')) {
     fs.mkdirSync('uploads');
 }
 
-// Automatically clean up the extracted folders after 5 minutes of inactivity
+// Automatically clean up the extracted folders after 30 minutes of inactivity
 // This way we don't hold on to sensitive data and prevent the server from getting full
 function scheduleCleanup(STR_JOB_ID, STR_FOLDER, STR_UPLOADED_FILE) {
     if(OBJ_CLEANUP_TIMERS[STR_JOB_ID]) {
@@ -89,6 +89,10 @@ OBJ_APP.get('/', (_, response) => {
     response.send('Server is running');
 });
 
+/**
+ * Extract the zip file into a new folder, named by a random UUID and return the UUID
+ * The UUID is returned as Job ID, so we can find this folder again when retrieving the files
+ */
 OBJ_APP.post('/extract', OBJ_UPLOAD_LIMITER, OBJ_UPLOAD.single('zipfile'), (request, response) => {
     // Retrieve the API key from the request header
     const STR_API_KEY = request.headers['x-api-key'];
@@ -138,20 +142,6 @@ OBJ_APP.post('/extract', OBJ_UPLOAD_LIMITER, OBJ_UPLOAD.single('zipfile'), (requ
             }
         }
 
-        // Insert a log into the database for the successful extraction
-        db.prepare(`
-            INSERT INTO requests (timestamp, token_name, filename, file_size_bytes, job_id, processing_time_ms, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            `).run(
-                new Date().toISOString(),
-                getTokenName(STR_API_KEY),
-                request.file.originalname,
-                request.file.size,
-                STR_JOB_ID,
-                Date.now() - DT_START_TIME,
-                'SUCCESS'
-            );
-
         console.log('Extracted to:', STR_EXTRACT_FOLDER);
         // Schedule the cleanup of the folder after 5 minutes
         scheduleCleanup(STR_JOB_ID, STR_EXTRACT_FOLDER, request.file.path);
@@ -163,68 +153,61 @@ OBJ_APP.post('/extract', OBJ_UPLOAD_LIMITER, OBJ_UPLOAD.single('zipfile'), (requ
         });
     })
     .on('error', (ex) => {
-        db.prepare(`
-            INSERT INTO requests (timestamp, token_name, filename, file_size_bytes, job_id, processing_time_ms, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            `).run(
-                new Date().toISOString(),
-                getTokenName(STR_API_KEY),
-                request.file.originalname,
-                request.file.size,
-                STR_JOB_ID,
-                Date.now() - DT_START_TIME,
-                'ERROR'
-            );
         response.status(500).json({error: 'Extraction failed', detail: ex.message});
     });
 });
 
 /**
- * Because we are limited by the 10MB file/response limit, we have to paginate the responses
+ * Here we build the object of the files.
+ * In our case, 1 invoice can have multiple XML files, but only 1 PDF.
+ * When finished, return the full object with all the files, grouped by Invoice number
  */
-OBJ_APP.get('/job/:jobId/xml', OBJ_FETCH_LIMITER, (request, response) => {
+OBJ_APP.get('/job/:jobId/invoices', OBJ_FETCH_LIMITER, (request, response) => {
     const STR_API_KEY = request.headers['x-api-key'];
-    // Validate the API key
-    if(!STR_API_KEY || !isValidToken(STR_API_KEY)) {
-        return response.status(401).json({error: 'Unauthorized'});
-    }
-    // Set the correct page to retrieve the files from
-    const INT_PAGE = parseInt(request.query.page) || 1;
-    const INT_PAGE_SIZE = parseInt(request.query.size) || 50;
 
+    // Validate API key
+    if (!STR_API_KEY || !isValidToken(STR_API_KEY)) {
+        return response.status(401).json({ error: 'Unauthorized' });
+    }
+
+    // Check if the folder exists on the server
     const STR_EXTRACT_FOLDER = path.join('uploads', request.params.jobId);
-    // Make sure the folder exists
-    if(!fs.existsSync(STR_EXTRACT_FOLDER)) {
-        return response.status(404).json({error: 'Job not found'});
+
+    if (!fs.existsSync(STR_EXTRACT_FOLDER)) {
+        return response.status(404).json({ error: 'Job not found' });
     }
 
-    logRequest('GET /xml', request.params.jobId, getTokenName(STR_API_KEY));
+    logRequest('GET /invoices', request.params.jobId, getTokenName(STR_API_KEY));
 
-    // Read the directory and obtain all XML files recursively
-    const ARR_ALL_XML = fs.readdirSync(STR_EXTRACT_FOLDER, {recursive: true})
-        .filter(f => !fs.statSync(path.join(STR_EXTRACT_FOLDER, f)).isDirectory() && f.endsWith('.xml'));
-    const ARR_PAGE = ARR_ALL_XML.slice((INT_PAGE - 1) * INT_PAGE_SIZE, INT_PAGE * INT_PAGE_SIZE);
+    const ARR_FILES = fs.readdirSync(STR_EXTRACT_FOLDER, { recursive: true })
+        .filter(f => !fs.statSync(path.join(STR_EXTRACT_FOLDER, f)).isDirectory());
+    const OBJ_INVOICES = {};
 
-    const OBJ_XML_CONTENTS = {};
-    for (const STR_FILE of ARR_PAGE) {
-        const STR_FILE_PATH = path.join(STR_EXTRACT_FOLDER, STR_FILE);
-        OBJ_XML_CONTENTS[path.basename(STR_FILE)] = fs.readFileSync(STR_FILE_PATH).toString('base64');
+    // For each file,  extract the invoice number and use it to build the object
+    for (const STR_FILE of ARR_FILES) {
+        const STR_BASENAME = path.basename(STR_FILE);
+        const ARR_PARTS = STR_BASENAME.split('-');
+        const STR_INVOICE_NUMBER = ARR_PARTS[ARR_PARTS.length - 2];
+
+        if (!OBJ_INVOICES[STR_INVOICE_NUMBER]) {
+            OBJ_INVOICES[STR_INVOICE_NUMBER] = { xmlFiles: [], pdfFile: null };
+        }
+
+        if (STR_BASENAME.endsWith('.xml')) {
+            OBJ_INVOICES[STR_INVOICE_NUMBER].xmlFiles.push(STR_FILE);
+        } else if (STR_BASENAME.endsWith('.pdf') && !OBJ_INVOICES[STR_INVOICE_NUMBER].pdfFile) {
+            OBJ_INVOICES[STR_INVOICE_NUMBER].pdfFile = STR_FILE;
+        }
     }
 
-    // Mark for cleanup after inactivity
     scheduleCleanup(request.params.jobId, STR_EXTRACT_FOLDER, '');
 
-    response.json({
-        page: INT_PAGE,
-        pageSize: INT_PAGE_SIZE,
-        totalFiles: ARR_ALL_XML.length,
-        totalPages: Math.ceil(ARR_ALL_XML.length / INT_PAGE_SIZE),
-        files: OBJ_XML_CONTENTS
-    });
+    response.json({ invoices: OBJ_INVOICES });
 });
 
 /**
- * Since we only have to obtain 1 PDF file per Invoice, we can retrieve them on a single fetch basis, instead of just pumping all the PDF files back
+ * Since we can't process hundreds of files at once, instead we retrieve them on a file to file basis.
+ * Each file is an API call and we just return the filename & contents
  */
 OBJ_APP.get('/job/:jobId/pdf', OBJ_FETCH_LIMITER, (request, response) => {
     const STR_API_KEY = request.headers['x-api-key'];
@@ -258,59 +241,24 @@ OBJ_APP.get('/job/:jobId/pdf', OBJ_FETCH_LIMITER, (request, response) => {
     response.json({ filename: path.basename(STR_FILE_PATH), content: STR_CONTENT });
 });
 
-OBJ_APP.get('/job/:jobId/invoices', OBJ_FETCH_LIMITER, (request, response) => {
-    const STR_API_KEY = request.headers['x-api-key'];
-
-    if (!STR_API_KEY || !isValidToken(STR_API_KEY)) {
-        return response.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const STR_EXTRACT_FOLDER = path.join('uploads', request.params.jobId);
-
-    if (!fs.existsSync(STR_EXTRACT_FOLDER)) {
-        return response.status(404).json({ error: 'Job not found' });
-    }
-
-    logRequest('GET /invoices', request.params.jobId, getTokenName(STR_API_KEY));
-
-    const ARR_FILES = fs.readdirSync(STR_EXTRACT_FOLDER, { recursive: true })
-        .filter(f => !fs.statSync(path.join(STR_EXTRACT_FOLDER, f)).isDirectory());
-    const OBJ_INVOICES = {};
-
-    for (const STR_FILE of ARR_FILES) {
-        const STR_BASENAME = path.basename(STR_FILE);
-        const ARR_PARTS = STR_BASENAME.split('-');
-        const STR_INVOICE_NUMBER = ARR_PARTS[ARR_PARTS.length - 2];
-
-        if (!OBJ_INVOICES[STR_INVOICE_NUMBER]) {
-            OBJ_INVOICES[STR_INVOICE_NUMBER] = { xmlFiles: [], pdfFile: null };
-        }
-
-        if (STR_BASENAME.endsWith('.xml')) {
-            OBJ_INVOICES[STR_INVOICE_NUMBER].xmlFiles.push(STR_FILE);
-        } else if (STR_BASENAME.endsWith('.pdf') && !OBJ_INVOICES[STR_INVOICE_NUMBER].pdfFile) {
-            OBJ_INVOICES[STR_INVOICE_NUMBER].pdfFile = STR_FILE;
-        }
-    }
-
-    scheduleCleanup(request.params.jobId, STR_EXTRACT_FOLDER, '');
-
-    response.json({ invoices: OBJ_INVOICES });
-});
-
+/**
+ * Since we can't process hundreds of files at once, instead we retrieve them on a file to file basis.
+ * Each file is an API call and we just return the filename & contents
+ */
 OBJ_APP.get('/job/:jobId/xml/file', OBJ_FETCH_LIMITER, (request, response) => {
     const STR_API_KEY = request.headers['x-api-key'];
 
+    // Validate the API key
     if (!STR_API_KEY || !isValidToken(STR_API_KEY)) {
         return response.status(401).json({ error: 'Unauthorized' });
     }
 
     const STR_EXTRACT_FOLDER = path.join('uploads', request.params.jobId);
     const STR_FILE_PATH = path.join(STR_EXTRACT_FOLDER, request.query.filename);
-
+    // Make sure we resolve the path so people can't execute anything outside the specified folder
     const STR_RESOLVED_PATH = path.resolve(STR_FILE_PATH);
     const STR_RESOLVED_FOLDER = path.resolve(STR_EXTRACT_FOLDER);
-
+    
     if (!STR_RESOLVED_PATH.startsWith(STR_RESOLVED_FOLDER)) {
         return response.status(400).json({ error: 'Invalid filename' });
     }
@@ -322,7 +270,7 @@ OBJ_APP.get('/job/:jobId/xml/file', OBJ_FETCH_LIMITER, (request, response) => {
     logRequest('GET /xml/:filename', request.params.jobId, getTokenName(STR_API_KEY));
 
     scheduleCleanup(request.params.jobId, STR_EXTRACT_FOLDER, '');
-
+    // Finally, obtain the data from the file and return it
     const STR_CONTENT = fs.readFileSync(STR_FILE_PATH).toString('base64');
     response.json({ filename: request.query.filename, content: STR_CONTENT });
 });

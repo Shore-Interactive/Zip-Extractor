@@ -11,7 +11,6 @@ const unzipper = require('unzipper');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const db = require('./db');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors')
 
@@ -142,7 +141,6 @@ OBJ_APP.post('/extract', OBJ_UPLOAD_LIMITER, OBJ_UPLOAD.single('zipfile'), (requ
             }
         }
 
-        console.log('Extracted to:', STR_EXTRACT_FOLDER);
         // Schedule the cleanup of the folder after 5 minutes
         scheduleCleanup(STR_JOB_ID, STR_EXTRACT_FOLDER, request.file.path);
 
